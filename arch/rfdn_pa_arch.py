@@ -34,7 +34,20 @@ class ESA(nn.Module):
 
         return x * m
 
+class PA(nn.Module):
+    '''PA is pixel attention'''
 
+    def __init__(self, nf):
+        super(PA, self).__init__()
+        self.conv = nn.Conv2d(nf, nf, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.conv(x)
+        y = self.sigmoid(y)
+        out = torch.mul(x, y)
+
+        return out
 
 class RFDB(nn.Module):
     def __init__(self, in_channels, distillation_rate=0.25):
@@ -53,7 +66,7 @@ class RFDB(nn.Module):
         self.act = nn.LeakyReLU(negative_slope=0.05, inplace=True)
 
         self.c5 = nn.Conv2d(self.dc * 4, in_channels, 1, 1, 0)
-        self.esa = ESA(in_channels)
+        self.pa = PA(in_channels)
 
     def forward(self, input):
 
@@ -72,7 +85,7 @@ class RFDB(nn.Module):
         r_c4 = self.act(self.c4(r_c3))
 
         out = torch.cat([distilled_c1, distilled_c2, distilled_c3, r_c4], dim=1)
-        out_fused = self.esa(self.c5(out))
+        out_fused = self.pa(self.c5(out))
 
         return out_fused
 
