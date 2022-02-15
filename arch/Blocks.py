@@ -13,9 +13,11 @@ import torch.nn.functional as F
 from distutils.version import LooseVersion
 
 
-# Depthwise Separable Convolution
+
+# 1*1卷积使用nn.Linear实现
 class DepthWiseConv(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1,
+                 dilation=1, bias=True, padding_mode="zeros", with_norm=True, bn_kwargs=None):
         super(DepthWiseConv, self).__init__()
         # 也相当于分组为1的分组卷积
         self.depth_conv = nn.Conv2d(in_channels=in_ch,
@@ -24,47 +26,49 @@ class DepthWiseConv(nn.Module):
                                     stride=1,
                                     padding=1,
                                     groups=in_ch)
-        self.point_conv = nn.Conv2d(in_channels=in_ch,
-                                    out_channels=out_ch,
-                                    kernel_size=1,
-                                    stride=1,
-                                    padding=0,
-                                    groups=1)
+        self.point_conv = nn.Linear(in_ch, out_ch)
+        # self.point_conv = nn.Conv2d(in_channels=in_ch,
+        #                             out_channels=out_ch,
+        #                             kernel_size=1,
+        #                             stride=1,
+        #                             padding=0,
+        #                             groups=1)
 
     def forward(self, input):
         out = self.depth_conv(input)
+        out = out.permute(0, 2, 3, 1)
         out = self.point_conv(out)
+        out = out.permute(0, 3, 1, 2)
         return out
 
 
-# Blueprint Separable Convolutions
-# BN will be replaced by LN
-class BSConvU(torch.nn.Sequential):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, bias=True, padding_mode="zeros", with_norm=False, bn_kwargs=None):
+class BSConvU(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1,
+                 dilation=1, bias=True, padding_mode="zeros", with_ln=True, bn_kwargs=None):
         super().__init__()
-
+        self.with_ln = with_ln
         # check arguments
         if bn_kwargs is None:
             bn_kwargs = {}
 
         # pointwise
-        self.add_module("pw", torch.nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=(1, 1),
-                stride=1,
-                padding=0,
-                dilation=1,
-                groups=1,
-                bias=False,
-        ))
-
+        self.pw = nn.Linear(in_channels, out_channels)
+        # self.pw=torch.nn.Conv2d(
+        #         in_channels=in_channels,
+        #         out_channels=out_channels,
+        #         kernel_size=(1, 1),
+        #         stride=1,
+        #         padding=0,
+        #         dilation=1,
+        #         groups=1,
+        #         bias=False,
+        # )
         # batchnorm
-        if with_norm:
-            self.add_module("ln", torch.nn.LayerNorm(out_channels, **bn_kwargs))
+        if with_ln:
+            self.ln = torch.nn.LayerNorm(out_channels, **bn_kwargs)
 
         # depthwise
-        self.add_module("dw", torch.nn.Conv2d(
+        self.dw = torch.nn.Conv2d(
                 in_channels=out_channels,
                 out_channels=out_channels,
                 kernel_size=kernel_size,
@@ -74,14 +78,22 @@ class BSConvU(torch.nn.Sequential):
                 groups=out_channels,
                 bias=bias,
                 padding_mode=padding_mode,
-        ))
+        )
+
+    def forward(self, fea):
+        fea = fea.permute(0, 2, 3, 1)
+        fea = self.pw(fea)
+        if self.with_ln:
+            fea = self.ln(fea)
+        fea = self.dw(fea.permute(0, 3, 1, 2))
+        return fea
 
 
-class BSConvS(torch.nn.Sequential):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, bias=True,
-                 padding_mode="zeros", p=0.25, min_mid_channels=4, with_bn=False, bn_kwargs=None):
+class BSConvS(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, dilation=1, bias=True,
+                 padding_mode="zeros", p=0.25, min_mid_channels=4, with_ln=True, bn_kwargs=None):
         super().__init__()
-
+        self.with_ln = with_ln
         # check arguments
         assert 0.0 <= p <= 1.0
         mid_channels = min(in_channels, max(min_mid_channels, math.ceil(p * in_channels)))
@@ -89,39 +101,41 @@ class BSConvS(torch.nn.Sequential):
             bn_kwargs = {}
 
         # pointwise 1
-        self.add_module("pw1", torch.nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=mid_channels,
-            kernel_size=(1, 1),
-            stride=1,
-            padding=0,
-            dilation=1,
-            groups=1,
-            bias=False,
-        ))
+        self.pw1 = nn.Linear(in_channels, mid_channels)
+        # self.pw1 = torch.nn.Conv2d(
+        #     in_channels=in_channels,
+        #     out_channels=mid_channels,
+        #     kernel_size=(1, 1),
+        #     stride=1,
+        #     padding=0,
+        #     dilation=1,
+        #     groups=1,
+        #     bias=False,
+        # )
 
         # batchnorm
-        if with_bn:
-            self.add_module("ln1", torch.nn.LayerNorm(out_channels, **bn_kwargs))
+        if with_ln:
+            self.ln1 = torch.nn.LayerNorm(mid_channels, **bn_kwargs)
 
         # pointwise 2
-        self.add_module("pw2", torch.nn.Conv2d(
-            in_channels=mid_channels,
-            out_channels=out_channels,
-            kernel_size=(1, 1),
-            stride=1,
-            padding=0,
-            dilation=1,
-            groups=1,
-            bias=False,
-        ))
+        self.pw2 = nn.Linear(mid_channels, out_channels)
+        # self.add_module("pw2", torch.nn.Conv2d(
+        #     in_channels=mid_channels,
+        #     out_channels=out_channels,
+        #     kernel_size=(1, 1),
+        #     stride=1,
+        #     padding=0,
+        #     dilation=1,
+        #     groups=1,
+        #     bias=False,
+        # ))
 
         # batchnorm
-        if with_bn:
-            self.add_module("ln2", torch.nn.LayerNorm(out_channels, **bn_kwargs))
+        if with_ln:
+            self.ln2 = torch.nn.LayerNorm(out_channels, **bn_kwargs)
 
         # depthwise
-        self.add_module("dw", torch.nn.Conv2d(
+        self.dw = torch.nn.Conv2d(
             in_channels=out_channels,
             out_channels=out_channels,
             kernel_size=kernel_size,
@@ -131,22 +145,24 @@ class BSConvS(torch.nn.Sequential):
             groups=out_channels,
             bias=bias,
             padding_mode=padding_mode,
-        ))
+        )
+
+    def forward(self, x):
+        fea = x.permute(0, 2, 3, 1)
+        fea = self.pw1(fea)
+        if self.with_ln:
+            fea = self.ln1(fea)
+        fea = self.pw2(fea)
+        if self.with_ln:
+            fea = self.ln2(fea)
+        fea = self.dw(fea.permute(0, 3, 1, 2))
+        return fea
 
     def _reg_loss(self):
         W = self[0].weight[:, :, 0, 0]
         WWt = torch.mm(W, torch.transpose(W, 0, 1))
         I = torch.eye(WWt.shape[0], device=WWt.device)
         return torch.norm(WWt - I, p="fro")
-
-
-class BSConvS_ModelRegLossMixin():
-    def reg_loss(self, alpha=0.1):
-        loss = 0.0
-        for sub_module in self.modules():
-            if hasattr(sub_module, "_reg_loss"):
-                loss += sub_module._reg_loss()
-        return alpha * loss
 
 
 # replicate the input RGB channels at the head of the net
@@ -226,6 +242,7 @@ class ShuffleV1Block(nn.Module):
             x = x.reshape(batchsize, num_channels, height, width)
 
             return x
+
 
 # shufflev2block
 # Gconv-->conv , remove channle shuffle in the branch
