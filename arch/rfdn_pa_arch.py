@@ -35,6 +35,69 @@ class PA(nn.Module):
 
         return out
 
+class PAConv(nn.Module):
+
+    def __init__(self, nf, k_size=3):
+        super(PAConv, self).__init__()
+        self.k2 = nn.Conv2d(nf, nf, 1)  # 1x1 convolution nf->nf
+        self.sigmoid = nn.Sigmoid()
+        self.k3 = nn.Conv2d(nf, nf, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)  # 3x3 convolution
+        self.k4 = nn.Conv2d(nf, nf, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)  # 3x3 convolution
+
+    def forward(self, x):
+        y = self.k2(x)
+        y = self.sigmoid(y)
+
+        out = torch.mul(self.k3(x), y)
+        out = self.k4(out)
+
+        return out
+
+
+class SCPA(nn.Module):
+    """SCPA is modified from SCNet (Jiang-Jiang Liu et al. Improving Convolutional Networks with Self-Calibrated Convolutions. In CVPR, 2020)
+        Github: https://github.com/MCG-NKU/SCNet
+    """
+
+    def __init__(self, nf, reduction=2, conv=nn.Conv2d, stride=1, dilation=1, p=0.25):
+        super(SCPA, self).__init__()
+        kwargs = {'padding': 1}
+        if conv.__name__ == 'BSConvS':
+            kwargs = {'p': p}
+        group_width = nf // reduction
+        self.conv1_a = nn.Conv2d(nf, group_width, kernel_size=1, bias=False)
+        self.conv1_b = nn.Conv2d(nf, group_width, kernel_size=1, bias=False)
+
+        self.k1 = nn.Sequential(
+            conv(
+                group_width, group_width, kernel_size=3, stride=stride,
+                dilation=dilation, bias=False, **kwargs)
+        )
+
+        self.PAConv = PAConv(group_width)
+
+        self.conv3 = nn.Conv2d(
+            group_width * reduction, nf, kernel_size=1, bias=False)
+
+        self.gelu = nn.GELU()
+
+    def forward(self, x):
+        residual = x
+
+        out_a = self.conv1_a(x)
+        out_b = self.conv1_b(x)
+        out_a = self.lrelu(out_a)
+        out_b = self.lrelu(out_b)
+
+        out_a = self.k1(out_a)
+        out_b = self.PAConv(out_b)
+        out_a = self.lrelu(out_a)
+        out_b = self.lrelu(out_b)
+
+        out = self.conv3(torch.cat([out_a, out_b], dim=1))
+        out += residual
+
+        return out
 
 class PA_UP(nn.Module):
     def __init__(self, nf, unf, out_nc, scale=4):
@@ -295,9 +358,9 @@ class ESA(nn.Module):
         return x * m
 
 
-class RFDB(nn.Module):
+class RFDB_PA(nn.Module):
     def __init__(self, in_channels, distillation_rate=0.25, conv=nn.Conv2d, p=0.25):
-        super(RFDB, self).__init__()
+        super(RFDB_PA, self).__init__()
         kwargs = {'padding': 1}
         if conv.__name__ == 'BSConvS':
             kwargs = {'p': p}
@@ -316,7 +379,7 @@ class RFDB(nn.Module):
         self.act = nn.GELU()
 
         self.c5 = nn.Conv2d(self.dc * 4, in_channels, 1, 1, 0)
-        self.pa = PA(in_channels, conv)
+        self.scpa = SCPA(in_channels, conv)
 
     def forward(self, input):
 
@@ -335,7 +398,7 @@ class RFDB(nn.Module):
         r_c4 = self.act(self.c4(r_c3))
 
         out = torch.cat([distilled_c1, distilled_c2, distilled_c3, r_c4], dim=1)
-        out_fused = self.pa(self.c5(out))
+        out_fused = self.scpa(self.c5(out))
 
         return out_fused
 
