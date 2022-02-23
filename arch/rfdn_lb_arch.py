@@ -15,6 +15,149 @@ import basicsr.archs.Upsamplers as Upsamplers
 from basicsr.utils.registry import ARCH_REGISTRY
 
 
+def mean_channels(x):
+    assert(x.dim() == 4)
+    spatial_sum = x.sum(3, keepdim=True).sum(2, keepdim=True)
+    return spatial_sum / (x.shape[2] * x.shape[3])
+
+def std(x):
+    assert(x.dim() == 4)
+    x_mean = mean_channels(x)
+    x_var = (x - x_mean).pow(2).sum(3, keepdim=True).sum(2, keepdim=True) / (x.shape[2] * x.shape[3])
+    return x_var.pow(0.5)
+
+class CoffConv(nn.Module):
+    def __init__(self, num_fea):
+        super(CoffConv, self).__init__()
+        self.AdaptiveAvgPool2d =  nn.AdaptiveAvgPool2d(1)
+        self.upper_branch = nn.Sequential(
+            nn.Linear(num_fea, num_fea // 16),
+            # nn.Conv2d(num_fea, num_fea // 16, 1, 1, 0),
+            nn.GELU(),
+            nn.Linear(num_fea // 16, num_fea),
+            # nn.Conv2d(num_fea // 16, num_fea, 1, 1, 0),
+            nn.GELU(),
+            nn.Sigmoid()
+        )
+        
+        self.std = std
+        self.lower_branch = nn.Sequential(
+            nn.Linear(num_fea, num_fea // 16),
+            # nn.Conv2d(num_fea, num_fea // 16, 1, 1, 0),
+            nn.GELU(),
+            nn.Linear(num_fea // 16, num_fea),
+            # nn.Conv2d(num_fea // 16, num_fea, 1, 1, 0),
+            nn.GELU(),
+            nn.Sigmoid()
+        )
+
+    def forward(self, fea):
+        fea_1 = self.AdaptiveAvgPool2d(fea).permute(0, 2, 3, 1)
+        upper = self.upper_branch(fea_1)
+        upper = upper.permute(0, 3, 1, 2)
+        lower = self.std(fea)
+        lower = self.lower_branch(lower.permute(0, 2, 3, 1))
+        lower = lower.permute(0, 3, 1, 2)
+
+        out = torch.add(upper, lower) / 2
+        
+        return out
+
+
+class LBlock(nn.Module):
+    def __init__(self, num_fea):
+        super(LBlock, self).__init__()
+        self.H_conv = nn.Sequential(
+            nn.Conv2d(num_fea, 48, 3, 1, 1),
+            nn.LeakyReLU(0.05),
+            nn.Conv2d(48, 48, 3, 1, 1),
+            nn.LeakyReLU(0.05),
+            nn.Conv2d(48, num_fea, 3, 1, 1),
+            nn.LeakyReLU(0.05),
+        )
+
+        self.A1_coff_conv = CoffConv(num_fea)
+        self.B1_coff_conv = CoffConv(num_fea)
+
+        self.G_conv = nn.Sequential(
+            nn.Conv2d(num_fea, 48, 3, 1, 1),
+            nn.LeakyReLU(0.05),
+            nn.Conv2d(48, 48, 3, 1, 1),
+            nn.LeakyReLU(0.05),
+            nn.Conv2d(48, num_fea, 3, 1, 1),
+            nn.LeakyReLU(0.05),
+        )
+
+        self.A2_coff_conv = CoffConv(num_fea)
+        self.B2_coff_conv = CoffConv(num_fea)
+
+        self.fuse = nn.Linear(num_fea*2, num_fea)
+        # self.fuse = nn.Conv2d(num_fea*2, num_fea, 1, 1, 0)
+
+
+    def forward(self, x):
+        H = self.H_conv(x)
+        A1 = self.A1_coff_conv(H)
+        P1 = x + A1*H
+        B1 = self.B1_coff_conv(x)
+        Q1 = H + B1*x
+
+        G = self.G_conv(P1)
+        B2 = self.B2_coff_conv(G)
+        Q2 = Q1 + B2*G
+        A2 = self.A2_coff_conv(Q1)
+        P2 = G + Q1*A2
+
+        out = torch.cat([P2, Q2], dim=1).permute(0, 2, 3, 1)
+        out = self.fuse(out).permute(0, 3, 1, 2)
+
+        return out
+
+
+class BFModule(nn.Module):
+    def __init__(self, num_fea):
+        super(BFModule, self).__init__()
+        # self.conv4 = nn.Conv2d(num_fea, num_fea//2, 1, 1, 0)
+        # self.conv3 = nn.Conv2d(num_fea, num_fea//2, 1, 1, 0)
+        # self.fuse43 = nn.Conv2d(num_fea, num_fea//2, 1, 1, 0)
+        # self.conv2 = nn.Conv2d(num_fea, num_fea//2, 1, 1,0)        
+        # self.fuse32 = nn.Conv2d(num_fea, num_fea//2, 1, 1, 0)
+        # self.conv1 = nn.Conv2d(num_fea, num_fea//2, 1, 1, 0)
+        self.conv4 = nn.Linear(num_fea, num_fea//2)
+        self.conv3 = nn.Linear(num_fea, num_fea//2)
+        self.fuse43 = nn.Linear(num_fea, num_fea//2)
+        self.conv2 = nn.Linear(num_fea, num_fea//2)
+        self.fuse32 = nn.Linear(num_fea, num_fea//2)
+        self.conv1 = nn.Linear(num_fea, num_fea//2)
+
+        self.act = nn.GELU(inplace=True)
+
+    # def forward(self, x_list):
+    #     dr_1 = self.conv4(x_list[3].permute(0, 2, 3, 1))
+    #     H4 = self.act(dr_1.permute(0, 3, 1, 2))
+    #     dr_2 = self.conv3(x_list[2].permute(0, 2, 3, 1))
+    #     H3_half = self.act(dr_2.permute(0, 3, 1, 2))
+    #     H3 = self.fuse43(torch.cat([H4, H3_half], dim=1).permute(0, 2, 3, 1))
+    #     H3 = H3.permute(0, 3, 1, 2)
+    #     dr_3 = self.conv2(x_list[2].permute(0, 2, 3, 1))      
+    #     H2_half = self.act(dr_3.permute(0, 3, 1, 2))
+    #     H2 = self.fuse32(torch.cat([H3, H2_half], dim=1).permute(0, 2, 3, 1))
+    #     H2 = H2.permute(0, 3, 1, 2)
+    #     H1_half = self.act(self.conv1(x_list[0]).permute(0, 2, 3, 1))
+    #     H1 = torch.cat([H2, H1_half], dim=1)
+
+    def forward(self, x_list):
+        H4 = self.act(self.conv4(x_list[3].permute(0, 2, 3, 1)))
+        H3_half = self.act(self.conv3(x_list[2].permute(0, 2, 3, 1)))
+        H3 = self.fuse43(torch.cat([H4, H3_half], dim=3))      
+        H2_half = self.act(self.conv2(x_list[1].permute(0, 2, 3, 1)))
+        H2 = self.fuse32(torch.cat([H3, H2_half], dim=3))
+        H1_half = self.act(self.conv1(x_list[0].permute(0, 2, 3, 1)))
+        H1 = torch.cat([H2, H1_half], dim=3)
+        H1 = H1.permute(0, 3, 1, 2)
+
+        return H1
+
 class ESA(nn.Module):
     def __init__(self, num_feat=50, conv=nn.Conv2d, p=0.25):
         super(ESA, self).__init__()
@@ -103,10 +246,10 @@ def make_layer(block, n_layers):
 
 
 @ARCH_REGISTRY.register()
-class RFDN(nn.Module):
+class RFDN_LB(nn.Module):
     def __init__(self, num_in_ch=3, num_feat=50, num_block=4, num_out_ch=3, upscale=4,
                  conv='DepthWiseConv', upsampler='pixelshuffledirect', p=0.25):
-        super(RFDN, self).__init__()
+        super(RFDN_LB, self).__init__()
         kwargs = {'padding': 1}
         if conv == 'BSConvS':
             kwargs = {'p': p}
@@ -123,12 +266,12 @@ class RFDN(nn.Module):
 
         # RFDB_block_f = functools.partial(RFDB, in_channels=num_feat, conv=self.conv, p=p)
         # RFDB_trunk = make_layer(RFDB_block_f, num_block)
-        self.B1 = RFDB(in_channels=num_feat, conv=self.conv, p=p)
-        self.B2 = RFDB(in_channels=num_feat, conv=self.conv, p=p)
-        self.B3 = RFDB(in_channels=num_feat, conv=self.conv, p=p)
-        self.B4 = RFDB(in_channels=num_feat, conv=self.conv, p=p)
-        self.B5 = RFDB(in_channels=num_feat, conv=self.conv, p=p)
-        self.B6 = RFDB(in_channels=num_feat, conv=self.conv, p=p)
+        self.B1 = LBlock(num_feat)
+        self.B2 = LBlock(num_feat)
+        self.B3 = LBlock(num_feat)
+        self.B4 = LBlock(num_feat)
+        self.B5 = LBlock(num_feat)
+        self.B6 = LBlock(num_feat)
         # self.B7 = RFDB(in_channels=num_feat, conv=self.conv, p=p)
 
         self.c1 = nn.Linear(num_feat * num_block, num_feat)
@@ -167,3 +310,21 @@ class RFDN(nn.Module):
         output = self.upsampler(out_lr)
 
         return output
+
+# if __name__ == '__main__':
+#     upscale = 4
+#     dec_rate = 0.9
+#     model = RFDN_LB(
+#         num_in_ch=3,
+#         num_feat=50,
+#         num_block=6,
+#         num_out_ch=3,
+#         upscale=4)
+#         # conv='BSconvU',
+#         # upsampler= 'pixelshuffledirect',
+#         # p=0.25,
+#         # dec_rate=0.9)
+#     print(model)
+#     x = torch.randn((1, 3, 256, 256))
+#     x = model(x)
+#     print(x.shape)

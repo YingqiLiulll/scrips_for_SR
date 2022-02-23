@@ -103,10 +103,10 @@ def make_layer(block, n_layers):
 
 
 @ARCH_REGISTRY.register()
-class RFDN_pyramid(nn.Module):
+class RFDN_oval(nn.Module):
     def __init__(self, num_in_ch=3, num_feat=50, num_block=4, num_out_ch=3, upscale=4,
-                 conv='DepthWiseConv', upsampler='pixelshuffledirect', p=0.25, dec_rate=0.8):
-        super(RFDN_pyramid, self).__init__()
+                 conv='DepthWiseConv', upsampler='pixelshuffledirect', p=0.25, change_c=15):  
+        super(RFDN_oval, self).__init__()
         kwargs = {'padding': 1}
         if conv == 'BSConvS':
             kwargs = {'p': p}
@@ -124,26 +124,26 @@ class RFDN_pyramid(nn.Module):
         # RFDB_block_f = functools.partial(RFDB, in_channels=num_feat, conv=self.conv, p=p)
         # RFDB_trunk = make_layer(RFDB_block_f, num_block)
         self.B1 = RFDB(in_channels=num_feat, conv=self.conv, p=p)
-        self.B1_c = nn.Linear(num_feat, int(num_feat * dec_rate))
+        self.map1 = nn.Linear(num_feat, num_feat + 1 * change_c)
 
-        self.B2 = RFDB(in_channels=int(num_feat * dec_rate), conv=self.conv, p=p)
-        self.B2_c = nn.Linear(int(num_feat * dec_rate), int(num_feat * dec_rate ** 2))
-        # 乘以dec_rate的平方
-        self.B3 = RFDB(in_channels=int(num_feat * dec_rate ** 2), conv=self.conv, p=p)
-        self.B3_c = nn.Linear(int(num_feat * dec_rate ** 2), int(num_feat * dec_rate ** 3))
+        self.B2 = RFDB(in_channels=num_feat + 1 * change_c, conv=self.conv, p=p)
+        self.map2 = nn.Linear(num_feat + 1 * change_c,num_feat + 2 * change_c)
 
-        self.B4 = RFDB(in_channels=int(num_feat * dec_rate ** 3), conv=self.conv, p=p)
-        self.B4_c = nn.Linear(int(num_feat * dec_rate ** 3), int(num_feat * dec_rate ** 4))
+        self.B3 = RFDB(in_channels=num_feat + 2 * change_c, conv=self.conv, p=p)
+        # self.map3 = nn.Linear(100, 100)
 
-        self.B5 = RFDB(in_channels=int(num_feat * dec_rate ** 4), conv=self.conv, p=p)
-        self.B5_c = nn.Linear(int(num_feat * dec_rate ** 4), int(num_feat * dec_rate ** 5))
+        self.B4 = RFDB(in_channels=num_feat + 2 * change_c, conv=self.conv, p=p)
+        self.map4 = nn.Linear(num_feat + 2 * change_c, num_feat + 1 * change_c)
 
-        self.B6 = RFDB(in_channels=int(num_feat * dec_rate ** 5), conv=self.conv, p=p)
+        self.B5 = RFDB(in_channels=num_feat + 1 * change_c, conv=self.conv, p=p)
+        self.map5 = nn.Linear(num_feat + 1 * change_c, num_feat)
+
+        self.B6 = RFDB(in_channels=num_feat, conv=self.conv, p=p)
         # self.B7 = RFDB(in_channels=num_feat, conv=self.conv, p=p)
-        num_cat = 0
-        for i in range(num_block):
-            num_cat += int(num_feat * dec_rate ** i)
-        self.c1 = nn.Linear(num_cat, num_feat)
+        total = (num_feat + change_c)*6
+        # for i in range(num_block):
+        #     total += num_feat - (i * reduce_c)
+        self.c1 = nn.Linear(total, num_feat)
         self.GELU = nn.GELU()
 
         self.c2 = self.conv(num_feat, num_feat, kernel_size=3, **kwargs)
@@ -163,53 +163,34 @@ class RFDN_pyramid(nn.Module):
     def forward(self, input):
         out_fea = self.fea_conv(input)
         out_B1 = self.B1(out_fea)
-        x = out_B1.permute(0, 2, 3, 1)
-        out_B1_c = (self.B1_c(x))
+        out_B1_next = self.map1(out_B1.permute(0, 2, 3, 1))
 
-        out_B2 = self.B2(out_B1_c.permute(0, 3, 1, 2))
-        x = out_B2.permute(0, 2, 3, 1)
-        out_B2_c = (self.B2_c(x))
+        out_B2 = self.B2(out_B1_next.permute(0, 3, 1, 2))
+        # out_B2 = self.B2(out_B1)
+        out_B2_next = self.map2(out_B2.permute(0, 2, 3, 1))
 
-        out_B3 = self.B3(out_B2_c.permute(0, 3, 1, 2))
-        x = out_B3.permute(0, 2, 3, 1)
-        out_B3_c = (self.B3_c(x))
+        out_B3 = self.B3(out_B2_next.permute(0, 3, 1, 2))
+        # out_B3_next = self.map3(out_B3.permute(0, 2, 3, 1))
 
-        out_B4 = self.B4(out_B3_c.permute(0, 3, 1, 2))
-        x = out_B4.permute(0, 2, 3, 1)
-        out_B4_c = (self.B4_c(x))
+        # out_B4 = self.B4(out_B3_next.permute(0, 3, 1, 2))
+        out_B4 = self.B4(out_B3)
+        out_B4_next = self.map4(out_B4.permute(0, 2, 3, 1))
 
-        out_B5 = self.B5(out_B4_c.permute(0, 3, 1, 2))
-        x = out_B5.permute(0, 2, 3, 1)
-        out_B5_c = (self.B5_c(x))
+        out_B5 = self.B5(out_B4_next.permute(0, 3, 1, 2))
+        out_B5_next = self.map5(out_B5.permute(0, 2, 3, 1))
 
-        out_B6 = self.B6(out_B5_c.permute(0, 3, 1, 2))
+        out_B6 = self.B6(out_B5_next.permute(0, 3, 1, 2))
+        # out_B6 = self.B6(out_B5)
         # out_B7 = self.B7(out_B6)
-        out_cat = torch.cat([out_B1, out_B2, out_B3, out_B4, out_B5, out_B6], dim=1)
-        # print(out_cat.shape)
-        out_B = self.c1(out_cat.permute(0, 2, 3, 1))
+        trunk = torch.cat([out_B1, out_B2, out_B3, out_B4, out_B5, out_B6], dim=1)
+        out_B = self.c1(trunk.permute(0, 2, 3, 1))
         out_B = self.GELU(out_B.permute(0, 3, 1, 2))
-
+        # print(out_B.shape)
         out_lr = self.c2(out_B) + out_fea
+
 
         # output = self.c3(out_lr)
         output = self.upsampler(out_lr)
 
         return output
 
-if __name__ == '__main__':
-    upscale = 4
-    dec_rate = 0.9
-    model = RFDN_pyramid(
-        num_in_ch=3,
-        num_feat=100,
-        num_block=6,
-        num_out_ch=3,
-        upscale=4,
-        conv='BSconvU',
-        upsampler= 'pixelshuffledirect',
-        p=0.25,
-        dec_rate=0.9)
-    print(model)
-    x = torch.randn((1, 3, 256, 256))
-    x = model(x)
-    print(x.shape)
