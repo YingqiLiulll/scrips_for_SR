@@ -14,116 +14,55 @@ import basicsr.archs.Blocks as Blocks
 import basicsr.archs.Upsamplers as Upsamplers
 from basicsr.utils.registry import ARCH_REGISTRY
 
-## Combination Coefficient
-class CC(nn.Module):
-    def __init__(self, channel, reduction=16):
-        super(CC, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv_mean = nn.Sequential(
-                nn.Linear(channel, channel // reduction),
-                # nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=True),
-                nn.GELU(),
-                nn.Linear(channel // reduction, channel),
-                # nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=True
-                nn.Sigmoid()
-        )
-        self.conv_std = nn.Sequential(
-                nn.Linear(channel, channel // reduction),
-                # nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=True),
-                nn.GELU(),
-                nn.Linear(channel // reduction, channel),
-                # nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=True),
-                nn.Sigmoid()
-        )
-
-    def forward(self, x):
-
-        # mean
-        ca_mean = self.avg_pool(x).permute(0, 2, 3, 1)
-        ca_mean = self.conv_mean(ca_mean)
-        ca_mean = ca_mean.permute(0, 3, 1, 2)
-        # std
-        m_batchsize, C, height, width = x.size()
-        x_dense = x.view(m_batchsize, C, -1)
-        ca_std = torch.std(x_dense, dim=2, keepdim=True)
-        ca_std = ca_std.view(m_batchsize, C, 1, 1)
-        ca_var = self.conv_std(ca_std.permute(0, 2, 3, 1))
-        ca_var = ca_var.permute(0, 3, 1, 2)
-        # Coefficient of Variation
-        # # cv1 = ca_std / ca_mean
-        # cv = torch.div(ca_std, ca_mean)
-        # ram = self.sigmoid(ca_mean + ca_var)
-
-        cc = (ca_mean + ca_var)/2.0
-        return cc
-
-class LatticeBlock(nn.Module):
-    def __init__(self, nFeat, nDiff=2, conv='BSConvU',p=0.25):
-    #def __init__(self, nFeat, nDiff, nFeat_slice):
-        super(LatticeBlock, self).__init__()
+class LPA(nn.Module):
+    def __init__(self, n_feats,conv='BSConvU'):
+        super(LPA, self).__init__()
         kwargs = {'padding': 1}
-        if conv == 'BSConvS':
-            kwargs = {'p': p}
-        if conv == 'DepthWiseConv':
-            self.conv = Blocks.DepthWiseConv
-        elif conv == 'BSConvU':
+        if conv == 'BSConvU':
             self.conv = Blocks.BSConvU
-        elif conv == 'BSConvS':
-            self.conv = Blocks.BSConvS
-        else:
-            self.conv = nn.Conv2d
-        self.D3 = nFeat
-        self.d = nDiff
-        # self.s = nFeat_slice
-
-        self.conv_block0 = nn.Sequential(
-            self.conv(nFeat, nFeat-nDiff, kernel_size=3, **kwargs),
-            nn.LeakyReLU(0.05),
-            self.conv(nFeat-nDiff, nFeat-nDiff, kernel_size=3, **kwargs),
-            nn.LeakyReLU(0.05),
-            self.conv(nFeat-nDiff, nFeat, kernel_size=3, **kwargs),
-            nn.LeakyReLU(0.05)
-        )
-
-        self.fea_ca1 = CC(nFeat)
-        self.x_ca1 = CC(nFeat)
-
-        self.conv_block1 = nn.Sequential(
-            self.conv(nFeat, nFeat-nDiff, kernel_size=3, **kwargs),
-            nn.LeakyReLU(0.05),
-            self.conv(nFeat-nDiff, nFeat-nDiff, kernel_size=3, **kwargs),
-            nn.LeakyReLU(0.05),
-            self.conv(nFeat-nDiff, nFeat, kernel_size=3, **kwargs),
-            nn.LeakyReLU(0.05)
-        )
-
-        self.fea_ca2 = CC(nFeat)
-        self.x_ca2 = CC(nFeat)
-
-        self.compress = nn.Linear(2 * nFeat, nFeat)
-        # self.compress = nn.Conv2d(2 * nFeat, nFeat, kernel_size=1, padding=0, bias=True)
+        f = n_feats // 4
+        # self.collapse = conv(n_feats, f, 1)
+        self.collapse = nn.Linear(n_feats,f)
+        self.squeeze = nn.MaxPool2d(4, 4)
+        self.redistribution = self.conv(f, f, kernel_size=3, **kwargs)
+        # self.restore = conv(f, n_feats, 1)
+        self.restore = nn.Linear(f, n_feats)
+        self.sigmoid = nn.Sigmoid()
+        self.act = nn.LeakyReLU(0.2, True)
 
     def forward(self, x):
-        # analyse unit
-        x_feature_shot = self.conv_block0(x)
-        fea_ca1 = self.fea_ca1(x_feature_shot)
-        x_ca1 = self.x_ca1(x)
+        y = self.collapse(x.permute(0, 2, 3, 1))
+        y = y.permute(0, 3, 1, 2)
+        res = y
+        y = self.squeeze(y)
+        y = self.redistribution(y)
+        y = F.interpolate(y, x.size()[2:], mode='bilinear', align_corners=False)
+        y = self.restore((y + res).permute(0, 2, 3, 1))
+        y = self.sigmoid(y.permute(0, 3, 1, 2))
+        return x * y
 
-        p1z = x + fea_ca1 * x_feature_shot
-        q1z = x_feature_shot + x_ca1 * x
+class CFB(nn.Module):
+    def __init__(self, n_feats,conv='BSConvU'):
+        super(CFB, self).__init__()
+        kwargs = {'padding': 1}
+        if conv == 'BSConvU':
+            self.conv = Blocks.BSConvU
+        self.conv1 = self.conv(n_feats, n_feats, kernel_size=3, **kwargs)
+        self.conv2 = self.conv(n_feats, n_feats, kernel_size=3, **kwargs)
+        self.conv3 = self.conv(n_feats, n_feats, kernel_size=3, **kwargs)
+        # self.fusion = conv(n_feats * 3, n_feats, 1)
+        self.fusion = nn.Linear(n_feats * 3, n_feats)
+        self.act = nn.LeakyReLU(0.2, True)
+        self.att = LPA(n_feats)
 
-        # synthes_unit
-        x_feat_long = self.conv_block1(p1z)
-        fea_ca2 = self.fea_ca2(q1z)
-        p3z = x_feat_long + fea_ca2 * q1z
-        x_ca2 = self.x_ca2(x_feat_long)
-        q3z = q1z + x_ca2 * x_feat_long
+    def forward(self, x):
+        x1 = self.act(self.conv1(x))
+        x2 = self.act(self.conv2(x1 + x))
+        x3 = self.act(self.conv3(x2 + x))
+        trunk = torch.cat([x1, x2, x3], 1).permute(0, 2, 3, 1)
+        x = self.att(self.fusion(trunk).permute(0, 3, 1, 2) + x)
+        return x
 
-        out = torch.cat((p3z, q3z), 1).permute(0, 2, 3, 1)
-        out = self.compress(out)
-        out = out.permute(0, 3, 1, 2)
-
-        return out
 
 class ESA(nn.Module):
     def __init__(self, num_feat=50, conv=nn.Conv2d, p=0.25):
@@ -213,13 +152,14 @@ def make_layer(block, n_layers):
 
 
 @ARCH_REGISTRY.register()
-class RFDN_LB2(nn.Module):
-    def __init__(self, num_in_ch=3, num_feat=50, num_block=6, num_out_ch=3, upscale=4,
+class RFDN_cascade(nn.Module):
+    def __init__(self, num_in_ch=3, num_feat=50, num_block=4, num_out_ch=3, upscale=4,
                  conv='DepthWiseConv', upsampler='pixelshuffledirect', p=0.25):
-        super(RFDN_LB2, self).__init__()
+        super(RFDN_cascade, self).__init__()
         kwargs = {'padding': 1}
         if conv == 'BSConvS':
             kwargs = {'p': p}
+        print(conv)
         if conv == 'DepthWiseConv':
             self.conv = Blocks.DepthWiseConv
         elif conv == 'BSConvU':
@@ -232,18 +172,19 @@ class RFDN_LB2(nn.Module):
 
         # RFDB_block_f = functools.partial(RFDB, in_channels=num_feat, conv=self.conv, p=p)
         # RFDB_trunk = make_layer(RFDB_block_f, num_block)
-        self.B1 = LatticeBlock(nFeat=50, nDiff=2)
-        self.B2 = LatticeBlock(nFeat=50, nDiff=2)
-        self.B3 = LatticeBlock(nFeat=50, nDiff=2)
-        self.B4 = LatticeBlock(nFeat=50, nDiff=2)
-        self.B5 = LatticeBlock(nFeat=50, nDiff=2)
-        self.B6 = LatticeBlock(nFeat=50, nDiff=2)
+        self.B1 = CFB(n_feats=num_feat, conv='BSConvU')
+        self.B2 = CFB(n_feats=num_feat, conv='BSConvU')
+        self.B3 = CFB(n_feats=num_feat, conv='BSConvU')
+        self.B4 = CFB(n_feats=num_feat, conv='BSConvU')
+        self.B5 = CFB(n_feats=num_feat, conv='BSConvU')
+        self.B6 = CFB(n_feats=num_feat, conv='BSConvU')
         # self.B7 = RFDB(in_channels=num_feat, conv=self.conv, p=p)
 
         self.c1 = nn.Linear(num_feat * num_block, num_feat)
         self.GELU = nn.GELU()
 
-        self.c2 = self.conv(num_feat, num_feat, kernel_size=3, **kwargs)
+        # self.c2 = self.conv(num_feat, num_feat, kernel_size=3, **kwargs)
+        self.c2 = LPA(n_feats=num_feat, conv='BSConvU')
 
 
         if upsampler == 'pixelshuffledirect':
@@ -277,20 +218,18 @@ class RFDN_LB2(nn.Module):
 
         return output
 
-# if __name__ == '__main__':
-#     upscale = 4
-#     dec_rate = 0.9
-#     model = RFDN_LB2(
-#         num_in_ch=3,
-#         num_feat=50,
-#         num_block=6,
-#         num_out_ch=3,
-#         upscale=4)
-#         # conv='BSconvU',
-#         # upsampler= 'pixelshuffledirect',
-#         # p=0.25,
-#         # dec_rate=0.9)
-#     print(model)
-#     x = torch.randn((1, 3, 256, 256))
-#     x = model(x)
-#     print(x.shape)
+if __name__ == '__main__':
+    upscale = 4
+    # dec_rate = 0.9
+    model = RFDN_cascade(
+        num_in_ch=3,
+        num_feat=50,
+        num_block=6,
+        num_out_ch=3,
+        upscale=4,
+        conv='BSconvU',
+        upsampler= 'pixelshuffledirect')
+    print(model)
+    x = torch.randn((1, 3, 256, 256))
+    x = model(x)
+    print(x.shape)

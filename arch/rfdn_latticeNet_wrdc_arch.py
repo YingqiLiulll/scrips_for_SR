@@ -13,6 +13,61 @@ import math
 import basicsr.archs.Blocks as Blocks
 import basicsr.archs.Upsamplers as Upsamplers
 from basicsr.utils.registry import ARCH_REGISTRY
+from torch.nn.parameter import Parameter
+
+class sa_layer(nn.Module):
+    """Constructs a Channel Spatial Group module.
+
+    Args:
+        k_size: Adaptive selection of kernel size
+    """
+
+    def __init__(self, channel, groups=50):
+        super(sa_layer, self).__init__()
+        self.groups = groups
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.cweight = Parameter(torch.zeros(1, channel // (2 * groups), 1, 1))
+        self.cbias = Parameter(torch.ones(1, channel // (2 * groups), 1, 1))
+        self.sweight = Parameter(torch.zeros(1, channel // (2 * groups), 1, 1))
+        self.sbias = Parameter(torch.ones(1, channel // (2 * groups), 1, 1))
+
+        self.sigmoid = nn.Sigmoid()
+        self.gn = nn.GroupNorm(channel // (2 * groups), channel // (2 * groups))
+
+    @staticmethod
+    def channel_shuffle(x, groups):
+        b, c, h, w = x.shape
+
+        x = x.reshape(b, groups, -1, h, w)
+        x = x.permute(0, 2, 1, 3, 4)
+
+        # flatten
+        x = x.reshape(b, -1, h, w)
+
+        return x
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        x = x.reshape(b * self.groups, -1, h, w)
+        x_0, x_1 = x.chunk(2, dim=1)
+
+        # channel attention
+        xn = self.avg_pool(x_0)
+        xn = self.cweight * xn + self.cbias
+        xn = x_0 * self.sigmoid(xn)
+
+        # spatial attention
+        xs = self.gn(x_1)
+        xs = self.sweight * xs + self.sbias
+        xs = x_1 * self.sigmoid(xs)
+
+        # concatenate along channel axis
+        out = torch.cat([xn, xs], dim=1)
+        out = out.reshape(b, -1, h, w)
+
+        out = self.channel_shuffle(out, 2)
+        return out
+
 
 ## Combination Coefficient
 class CC(nn.Module):
@@ -57,49 +112,125 @@ class CC(nn.Module):
         cc = (ca_mean + ca_var)/2.0
         return cc
 
-class LatticeBlock(nn.Module):
-    def __init__(self, nFeat, nDiff=2, conv='BSConvU',p=0.25):
-    #def __init__(self, nFeat, nDiff, nFeat_slice):
-        super(LatticeBlock, self).__init__()
-        kwargs = {'padding': 1}
-        if conv == 'BSConvS':
-            kwargs = {'p': p}
-        if conv == 'DepthWiseConv':
-            self.conv = Blocks.DepthWiseConv
-        elif conv == 'BSConvU':
-            self.conv = Blocks.BSConvU
-        elif conv == 'BSConvS':
-            self.conv = Blocks.BSConvS
-        else:
-            self.conv = nn.Conv2d
-        self.D3 = nFeat
-        self.d = nDiff
-        # self.s = nFeat_slice
 
-        self.conv_block0 = nn.Sequential(
-            self.conv(nFeat, nFeat-nDiff, kernel_size=3, **kwargs),
-            nn.LeakyReLU(0.05),
-            self.conv(nFeat-nDiff, nFeat-nDiff, kernel_size=3, **kwargs),
-            nn.LeakyReLU(0.05),
-            self.conv(nFeat-nDiff, nFeat, kernel_size=3, **kwargs),
-            nn.LeakyReLU(0.05)
+class YQBlock(nn.Module):
+    def __init__(self, in_ch, reScale):
+        super(YQBlock, self).__init__()
+        if in_ch % 2 != 0:
+            assert ValueError("odd in_ch!")
+        conv = Blocks.BSConvU
+        BSConvS_kwargs = {}
+        if conv.__name__ == 'BSConvS':
+            BSConvS_kwargs = {'p': 0.25}
+        self.in_ch = in_ch
+        rc = in_ch // 2
+        self.head_conv = nn.Sequential(
+            nn.Linear(in_ch, in_ch),
+            nn.GELU(),
+            nn.Linear(in_ch, in_ch))
+        self.mapping = conv(in_ch, in_ch, kernel_size=3, with_ln=False, **BSConvS_kwargs)
+        
+        self.act = nn.LeakyReLU(0.05)
+        self.sigmoid = nn.Sigmoid()
+        self.sa = sa_layer(in_ch,groups=5)
+        self.lamRes = reScale[0]
+        self.lamX = reScale[1]
+
+        # upper
+        self.upper_linear = nn.Linear(rc, in_ch)
+        self.upper_dw = torch.nn.Conv2d(
+            in_channels=in_ch,
+            out_channels=in_ch,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            dilation=1,
+            groups=in_ch,
+            bias=True,
+            padding_mode="zeros",
         )
+
+        # lower
+        self.lower_linear = nn.Sequential(
+            nn.Linear(rc, in_ch),
+            nn.GELU(),
+            nn.Linear(in_ch, in_ch))
+        self.lower_dw = torch.nn.Conv2d(
+            in_channels=in_ch,
+            out_channels=in_ch,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            dilation=1,
+            groups=in_ch,
+            bias=True,
+            padding_mode="zeros",
+        )
+        self.sa = sa_layer(in_ch, groups=5)
+
+        # lower of lower
+        self.lower_of_lower_linear = nn.Sequential(
+            nn.Linear(rc, in_ch),
+            nn.GELU(),
+            nn.Linear(in_ch, in_ch))
+        self.lower_of_lower_dw = torch.nn.Conv2d(
+            in_channels=in_ch,
+            out_channels=in_ch,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            dilation=1,
+            groups=in_ch,
+            bias=True,
+            padding_mode="zeros",
+        )
+
+
+
+    def forward(self, input):
+        # SRB
+        # print(input.shape)
+        x = self.head_conv(input.permute(0, 2, 3, 1))
+        x = self.mapping(x.permute(0, 3, 1, 2))
+        x_act = self.act(x)
+        head_out = self.lamX * self.sa(x_act)
+        head_out = self.lamRes * input + head_out
+
+
+        # Channel Split
+        upper, lower = torch.split(head_out, (self.in_ch//2, self.in_ch//2),dim=1)
+
+        # upper
+        upper = self.upper_linear(upper.permute(0, 2, 3, 1))
+        upper = self.upper_dw(upper.permute(0, 3, 1, 2))
+        upper_attn = self.sigmoid(upper)
+
+        # lower
+        lower_0 = self.lower_linear(lower.permute(0, 2, 3, 1))
+        lower_0 = self.lower_dw(lower_0.permute(0, 3, 1, 2))
+        lower_0 = self.sa(lower_0)
+
+        lower_1 = self.lower_of_lower_linear(lower.permute(0, 2, 3, 1))
+        lower_1 = self.lower_of_lower_dw(lower_1.permute(0, 3, 1, 2))
+
+        lower_out = self.lamRes * lower_1 + self.lamX * lower_0
+        out = torch.mul(lower_out, upper_attn)
+        return out
+
+
+class LatticeBlock(nn.Module):
+    def __init__(self, nFeat, reScale):
+        super(LatticeBlock, self).__init__()
+
+        self.D3 = nFeat
+        self.conv_block0 = YQBlock(nFeat, reScale)
 
         self.fea_ca1 = CC(nFeat)
         self.x_ca1 = CC(nFeat)
-
-        self.conv_block1 = nn.Sequential(
-            self.conv(nFeat, nFeat-nDiff, kernel_size=3, **kwargs),
-            nn.LeakyReLU(0.05),
-            self.conv(nFeat-nDiff, nFeat-nDiff, kernel_size=3, **kwargs),
-            nn.LeakyReLU(0.05),
-            self.conv(nFeat-nDiff, nFeat, kernel_size=3, **kwargs),
-            nn.LeakyReLU(0.05)
-        )
-
+        
+        self.conv_block1 = YQBlock(nFeat, reScale)
         self.fea_ca2 = CC(nFeat)
         self.x_ca2 = CC(nFeat)
-
         self.compress = nn.Linear(2 * nFeat, nFeat)
         # self.compress = nn.Conv2d(2 * nFeat, nFeat, kernel_size=1, padding=0, bias=True)
 
@@ -119,11 +250,17 @@ class LatticeBlock(nn.Module):
         x_ca2 = self.x_ca2(x_feat_long)
         q3z = q1z + x_ca2 * x_feat_long
 
+        # out = torch.cat((p3z, q3z), 1)
+        # out = self.compress(out)
         out = torch.cat((p3z, q3z), 1).permute(0, 2, 3, 1)
         out = self.compress(out)
         out = out.permute(0, 3, 1, 2)
 
         return out
+
+class Config():
+    lamRes = torch.nn.Parameter(torch.ones(1))
+    lamX = torch.nn.Parameter(torch.ones(1))
 
 class ESA(nn.Module):
     def __init__(self, num_feat=50, conv=nn.Conv2d, p=0.25):
@@ -213,13 +350,14 @@ def make_layer(block, n_layers):
 
 
 @ARCH_REGISTRY.register()
-class RFDN_LB2(nn.Module):
-    def __init__(self, num_in_ch=3, num_feat=50, num_block=6, num_out_ch=3, upscale=4,
+class RFDN_latticeNet(nn.Module):
+    def __init__(self, num_in_ch=3, num_feat=50, num_block=4, num_out_ch=3, upscale=4,
                  conv='DepthWiseConv', upsampler='pixelshuffledirect', p=0.25):
-        super(RFDN_LB2, self).__init__()
+        super(RFDN_latticeNet, self).__init__()
         kwargs = {'padding': 1}
         if conv == 'BSConvS':
             kwargs = {'p': p}
+        print(conv)
         if conv == 'DepthWiseConv':
             self.conv = Blocks.DepthWiseConv
         elif conv == 'BSConvU':
@@ -229,15 +367,18 @@ class RFDN_LB2(nn.Module):
         else:
             self.conv = nn.Conv2d
         self.fea_conv = self.conv(num_in_ch, num_feat, kernel_size=3, **kwargs)
+        lamRes = torch.nn.Parameter(torch.ones(1))
+        lamX = torch.nn.Parameter(torch.ones(1))
+        self.adaptiveWeight = (lamRes, lamX)
 
         # RFDB_block_f = functools.partial(RFDB, in_channels=num_feat, conv=self.conv, p=p)
         # RFDB_trunk = make_layer(RFDB_block_f, num_block)
-        self.B1 = LatticeBlock(nFeat=50, nDiff=2)
-        self.B2 = LatticeBlock(nFeat=50, nDiff=2)
-        self.B3 = LatticeBlock(nFeat=50, nDiff=2)
-        self.B4 = LatticeBlock(nFeat=50, nDiff=2)
-        self.B5 = LatticeBlock(nFeat=50, nDiff=2)
-        self.B6 = LatticeBlock(nFeat=50, nDiff=2)
+        self.B1 = LatticeBlock(num_feat, reScale=self.adaptiveWeight)
+        self.B2 = LatticeBlock(num_feat, reScale=self.adaptiveWeight)
+        self.B3 = LatticeBlock(num_feat, reScale=self.adaptiveWeight)
+        self.B4 = LatticeBlock(num_feat, reScale=self.adaptiveWeight)
+        # self.B5 = RFDB(in_channels=num_feat, conv=self.conv, p=p)
+        # self.B6 = RFDB(in_channels=num_feat, conv=self.conv, p=p)
         # self.B7 = RFDB(in_channels=num_feat, conv=self.conv, p=p)
 
         self.c1 = nn.Linear(num_feat * num_block, num_feat)
@@ -263,10 +404,10 @@ class RFDN_LB2(nn.Module):
         out_B2 = self.B2(out_B1)
         out_B3 = self.B3(out_B2)
         out_B4 = self.B4(out_B3)
-        out_B5 = self.B5(out_B4)
-        out_B6 = self.B6(out_B5)
+        # out_B5 = self.B5(out_B4)
+        # out_B6 = self.B6(out_B5)
         # out_B7 = self.B7(out_B6)
-        trunk = torch.cat([out_B1, out_B2, out_B3, out_B4, out_B5, out_B6], dim=1)
+        trunk = torch.cat([out_B1, out_B2, out_B3, out_B4], dim=1)
         out_B = self.c1(trunk.permute(0, 2, 3, 1))
         out_B = self.GELU(out_B.permute(0, 3, 1, 2))
         # print(out_B.shape)
@@ -280,10 +421,10 @@ class RFDN_LB2(nn.Module):
 # if __name__ == '__main__':
 #     upscale = 4
 #     dec_rate = 0.9
-#     model = RFDN_LB2(
+#     model = RFDN_latticeNet(
 #         num_in_ch=3,
 #         num_feat=50,
-#         num_block=6,
+#         num_block=4,
 #         num_out_ch=3,
 #         upscale=4)
 #         # conv='BSconvU',

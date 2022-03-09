@@ -59,17 +59,22 @@ class RFDB(nn.Module):
         self.dc = self.distilled_channels = in_channels // 2
         self.rc = self.remaining_channels = in_channels
 
-        self.c1_d = nn.Linear(in_channels, self.dc)
+        self.c1_d = nn.Linear(in_channels, self.rc)
         self.c1_r = conv(in_channels, self.rc, kernel_size=3,  **kwargs)
-        self.c2_d = nn.Linear(self.remaining_channels, self.dc)
+        self.c2_d = nn.Linear(self.remaining_channels, self.rc)
         self.c2_r = conv(self.remaining_channels, self.rc, kernel_size=3, **kwargs)
-        self.c3_d = nn.Linear(self.remaining_channels, self.dc)
+        self.c3_d = nn.Linear(self.remaining_channels, self.rc)
         self.c3_r = conv(self.remaining_channels, self.rc, kernel_size=3, **kwargs)
 
-        self.c4 = conv(self.remaining_channels, self.dc, kernel_size=3, **kwargs)
+        self.c4 = conv(self.remaining_channels, in_channels, kernel_size=3, **kwargs)
         self.act = nn.GELU()
 
-        self.c5 = nn.Linear(self.dc * 4, in_channels)
+        self.alpha1 = nn.Parameter(torch.ones(1, in_channels))
+        self.alpha2 = nn.Parameter(torch.ones(1, in_channels))
+        self.alpha3 = nn.Parameter(torch.ones(1, in_channels))
+        self.alpha4 = nn.Parameter(torch.ones(1, in_channels))
+
+        # self.c5 = nn.Linear(self.rc, in_channels)
         self.esa = ESA(in_channels, conv)
         self.conv_out = nn.Linear(in_channels, out_channels)
 
@@ -89,9 +94,10 @@ class RFDB(nn.Module):
 
         r_c4 = self.act(self.c4(r_c3))
 
-        out = torch.cat([distilled_c1, distilled_c2, distilled_c3, r_c4.permute(0, 2, 3, 1)], dim=3)
-        out = self.c5(out).permute(0, 3, 1, 2)
-        out_fused = self.esa(out)
+        # out = torch.cat([distilled_c1, distilled_c2, distilled_c3, r_c4.permute(0, 2, 3, 1)], dim=3)
+        out = distilled_c1 * self.alpha1 + distilled_c2 * self.alpha2 + distilled_c3 * self.alpha3 + r_c4.permute(0, 2, 3, 1) * self.alpha4
+        # out = self.c5(out)
+        out_fused = self.esa(out.permute(0, 3, 1, 2))
         out_fused = self.conv_out(out_fused.permute(0, 2, 3, 1))
 
         return out_fused.permute(0, 3, 1, 2) + input
@@ -105,10 +111,10 @@ def make_layer(block, n_layers):
 
 
 @ARCH_REGISTRY.register()
-class RFDN(nn.Module):
+class RFDNADD(nn.Module):
     def __init__(self, num_in_ch=3, num_feat=50, num_block=4, num_out_ch=3, upscale=4,
                  conv='DepthWiseConv', upsampler='pixelshuffledirect', p=0.25):
-        super(RFDN, self).__init__()
+        super(RFDNADD, self).__init__()
         kwargs = {'padding': 1}
         if conv == 'BSConvS':
             kwargs = {'p': p}
@@ -171,3 +177,20 @@ class RFDN(nn.Module):
 
         return output
 
+if __name__ == '__main__':
+    upscale = 4
+    dec_rate = 0.9
+    model = RFDNADD(
+        num_in_ch=3,
+        num_feat=50,
+        num_block=6,
+        num_out_ch=3,
+        upscale=4)
+        # conv='BSconvU',
+        # upsampler= 'pixelshuffledirect',
+        # p=0.25,
+        # dec_rate=0.9)
+    print(model)
+    x = torch.randn((1, 3, 256, 256))
+    x = model(x)
+    print(x.shape)
